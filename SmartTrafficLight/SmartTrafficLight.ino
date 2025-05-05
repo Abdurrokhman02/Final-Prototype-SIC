@@ -1,77 +1,61 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <WebServer.h>
 #include <ArduinoJson.h>
 
-// Model Kamera
 #define CAMERA_MODEL_WROVER_KIT
 #include "camera_pins.h"
 
-// Konfigurasi OLED
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_RESET -1
-#define OLED_SDA 32
-#define OLED_SCL 33
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-
-// Konfigurasi WiFi
+// ========== KONFIGURASI JARINGAN ==========
 const char* ssid = "Kos ijo";
 const char* password = "Aslan199";
 
-// Konfigurasi IP Statis
-IPAddress local_IP(192, 168, 1, 101);
+// IP Statis ESP32 (cam3)
+IPAddress local_IP(192, 168, 1, 103);
 IPAddress gateway(192, 168, 1, 1);
 IPAddress subnet(255, 255, 255, 0);
-IPAddress primaryDNS(8, 8, 8, 8);
-IPAddress secondaryDNS(8, 8, 4, 4);
 
-const char* flaskTriggerEndpoint = "http://192.168.1.3:5000/trigger_capture";
+// IP Server Flask
+const char* SERVER_URL = "http://192.168.1.3:5000";
 
-// Pin LED
-#define LED_MERAH 14
-#define LED_KUNING 12
+// ========== KONFIGURASI HARDWARE ==========
+#define LED_MERAH 12
+#define LED_KUNING 14  // Pin 4 diubah ke 14 untuk AI Thinker
 #define LED_HIJAU 13
 
-// Durasi Lampu (ms)
-#define DURASI_MERAH 10000
-#define DURASI_KUNING 3000
-unsigned long DURASI_HIJAU = 10000; // Default value, will be updated from server
+// ========== VARIABEL KONTROL ==========
+enum LampuState { MERAH, KUNING_MENUJU_HIJAU, HIJAU, KUNING_MENUJU_MERAH };
+LampuState currentState = MERAH;
+unsigned long stateStartTime = 0;
+unsigned long stateDuration = 0;
+WebServer server(80);
 
-void startCameraServer();
+// ========== PROTOTIPE FUNGSI ==========
+String getStateName(LampuState state);
+void sendToServer(String payload);
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  
-  // Inisialisasi I2C dan OLED
-  Wire.begin(OLED_SDA, OLED_SCL);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;);
-  }
   
   // Inisialisasi LED
   pinMode(LED_MERAH, OUTPUT);
   pinMode(LED_KUNING, OUTPUT);
   pinMode(LED_HIJAU, OUTPUT);
-  digitalWrite(LED_MERAH, LOW);
-  digitalWrite(LED_KUNING, LOW);
-  digitalWrite(LED_HIJAU, LOW);
+  setLampuState(MERAH, 0);
 
-  // Tampilkan startup screen
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(WHITE);
-  display.setCursor(0,0);
-  display.println("Starting...");
-  display.display();
-  delay(2000);
+  // Koneksi WiFi
+  WiFi.config(local_IP, gateway, subnet);
+  WiFi.begin(ssid, password);
+  
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
 
-  // Konfigurasi kamera
+  // Inisialisasi Kamera
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -97,192 +81,142 @@ void setup() {
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count = 1;
-  
-  // Inisialisasi kamera
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
-    display.clearDisplay();
-    display.setCursor(0,0);
-    display.println("Camera Error");
-    display.display();
+    Serial.printf("Camera init failed: 0x%x", err);
     while(1) delay(100);
   }
 
-  // Konfigurasi WiFi
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("Failed to configure static IP");
-  }
+  // Endpoint Server
+  server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/set_lights", HTTP_POST, handleSetLights);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.begin();
 
-  WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
-  
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.println("Connecting to");
-  display.println("WiFi...");
-  display.display();
-  
-  unsigned long startAttemptTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 20000) {
-    delay(500);
-    Serial.print(".");
-  }
-  
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nFailed to connect!");
-    display.clearDisplay();
-    display.setCursor(0,0);
-    display.println("WiFi Failed!");
-    display.display();
-    while(1) {
-      digitalWrite(LED_MERAH, HIGH);
-      delay(500);
-      digitalWrite(LED_MERAH, LOW);
-      delay(500);
-    }
-  }
-  
-  Serial.println("\nConnected!");
-  Serial.print("IP Address: ");
-  Serial.println(WiFi.localIP());
-
-  delay(3000);
-  startCameraServer();
-  Serial.println("Camera streaming server started");
-}
-
-void triggerSnapshot() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected!");
-    return;
-  }
-
-  HTTPClient http;
-  http.begin(flaskTriggerEndpoint);
-  http.addHeader("Content-Type", "application/json");
-  
-  int httpCode = http.POST("{\"trigger\":true}");
-  
-  if (httpCode > 0) {
-    if (httpCode == HTTP_CODE_OK) {
-      String payload = http.getString();
-      Serial.println("Server response: " + payload);
-      
-      DynamicJsonDocument doc(1024);
-      DeserializationError error = deserializeJson(doc, payload);
-      
-      if (error) {
-        Serial.print(F("deserializeJson() failed: "));
-        Serial.println(error.f_str());
-        http.end();
-        return;
-      }
-      
-      if (doc.containsKey("duration")) {
-        // Konversi eksplisit ke unsigned long
-        unsigned long durationSec = doc["duration"];
-        DURASI_HIJAU = durationSec * 1000;
-        
-        Serial.printf("Got new green duration: %lu ms\n", DURASI_HIJAU);
-      } else {
-        Serial.println("No duration field in response");
-      }
-    }
-  } else {
-    Serial.printf("[HTTP] Failed, error: %s\n", http.errorToString(httpCode).c_str());
-  }
-  
-  http.end();
-}
-
-void updateOLED(String state, unsigned long remainingTime) {
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(0,0);
-  display.println(state);
-  
-  display.setCursor(0, 30);
-  display.print(remainingTime / 1000);
-  display.println("s");
-  
-  if (state == "HIJAU") {
-    display.setCursor(0, 50);
-    display.print(DURASI_HIJAU / 1000);
-    display.println("s");
-  }
-  
-  display.display();
+  // Lapor ke server utama
+  String payload = "{\"esp_id\":\"esp3\",\"status\":\"ready\",\"ip\":\"" + WiFi.localIP().toString() + "\"}";
+  sendToServer(payload);
 }
 
 void loop() {
-  static enum { MERAH, KUNING_MENUJU_HIJAU, HIJAU, KUNING_MENUJU_MERAH } state = MERAH;
-  static unsigned long lastChange = millis();
-  static bool shouldTrigger = false;
+  server.handleClient();
+  updateLampuState();
+}
 
-  // Kontrol LED
-  digitalWrite(LED_MERAH, state == MERAH || state == KUNING_MENUJU_MERAH);
-  digitalWrite(LED_KUNING, state == KUNING_MENUJU_HIJAU || state == KUNING_MENUJU_MERAH);
-  digitalWrite(LED_HIJAU, state == HIJAU);
+// ========== FUNGSI UTAMA ==========
+void setLampuState(LampuState newState, unsigned long duration) {
+  currentState = newState;
+  stateStartTime = millis();
+  stateDuration = duration;
 
-  // State machine
-  unsigned long now = millis();
-  unsigned long elapsed = now - lastChange;
-  unsigned long remainingTime = 0;
-  String stateName = "";
+  // Update LED
+  digitalWrite(LED_MERAH, currentState == MERAH || currentState == KUNING_MENUJU_MERAH);
+  digitalWrite(LED_KUNING, currentState == KUNING_MENUJU_HIJAU || currentState == KUNING_MENUJU_MERAH);
+  digitalWrite(LED_HIJAU, currentState == HIJAU);
+
+  // Debug log
+  Serial.println("State changed to: " + getStateName(currentState) + " for " + String(duration/1000) + "s");
   
+  // Kirim update ke server
+  String payload = "{\"esp_id\":\"esp3\",\"state\":\"" + getStateName(currentState) + "\"";
+  payload += ",\"remaining\":" + String(duration/1000) + "}";
+  sendToServer(payload);
+}
+
+void updateLampuState() {
+  if (stateDuration == 0) return;
+  
+  unsigned long elapsed = millis() - stateStartTime;
+  if (elapsed >= stateDuration) {
+    switch(currentState) {
+      case KUNING_MENUJU_HIJAU:
+        setLampuState(HIJAU, stateDuration);
+        break;
+      case HIJAU:
+        setLampuState(KUNING_MENUJU_MERAH, 3000);
+        break;
+      case KUNING_MENUJU_MERAH:
+        setLampuState(MERAH, 0);
+        break;
+      default: break;
+    }
+  }
+}
+
+// ========== HANDLER HTTP ==========
+void handleCapture() {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    server.send(500, "text/plain", "Camera error");
+    return;
+  }
+  
+  server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+}
+
+void handleSetLights() {
+  if (server.method() != HTTP_POST) {
+    server.send(405, "text/plain", "Method not allowed");
+    return;
+  }
+
+  DynamicJsonDocument doc(256);
+  DeserializationError error = deserializeJson(doc, server.arg("plain"));
+  if (error) {
+    server.send(400, "text/plain", "Bad request");
+    return;
+  }
+
+  String command = doc["command"];
+  unsigned long duration = doc["duration"];
+
+  if (command == "START_HIJAU") {
+    setLampuState(KUNING_MENUJU_HIJAU, 3000);
+    stateDuration = duration * 1000;
+  } 
+  else if (command == "START_MERAH") {
+    setLampuState(MERAH, duration * 1000);
+  }
+
+  server.send(200, "application/json", "{\"status\":\"ok\"}");
+}
+
+void handleStatus() {
+  DynamicJsonDocument doc(256);
+  doc["state"] = getStateName(currentState);
+  doc["remaining"] = (stateDuration > 0) ? (stateDuration - (millis() - stateStartTime)) / 1000 : 0;
+  doc["ip"] = WiFi.localIP().toString();
+
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+// ========== FUNGSI PENDUKUNG ==========
+String getStateName(LampuState state) {
   switch(state) {
-    case MERAH:
-      remainingTime = DURASI_MERAH - elapsed;
-      stateName = "MERAH";
-      if (elapsed > DURASI_MERAH) {
-        state = KUNING_MENUJU_HIJAU;
-        lastChange = now;
-        shouldTrigger = true;
-      }
-      break;
-      
-    case KUNING_MENUJU_HIJAU:
-      remainingTime = DURASI_KUNING - elapsed;
-      stateName = "KUNING";
-      if (elapsed > DURASI_KUNING) {
-        state = HIJAU;
-        lastChange = now;
-      } else if (shouldTrigger && (elapsed > 1000)) {
-        triggerSnapshot();
-        shouldTrigger = false;
-      }
-      break;
-      
-    case HIJAU:
-      remainingTime = DURASI_HIJAU - elapsed;
-      stateName = "HIJAU";
-      if (elapsed > DURASI_HIJAU) {
-        state = KUNING_MENUJU_MERAH;
-        lastChange = now;
-        shouldTrigger = true;
-      }
-      break;
-      
-    case KUNING_MENUJU_MERAH:
-      remainingTime = DURASI_KUNING - elapsed;
-      stateName = "KUNING";
-      if (elapsed > DURASI_KUNING) {
-        state = MERAH;
-        lastChange = now;
-      } else if (shouldTrigger && (elapsed > 1000)) {
-        triggerSnapshot();
-        shouldTrigger = false;
-      }
-      break;
+    case MERAH: return "MERAH";
+    case KUNING_MENUJU_HIJAU: return "KUNING_MENUJU_HIJAU";
+    case HIJAU: return "HIJAU";
+    case KUNING_MENUJU_MERAH: return "KUNING_MENUJU_MERAH";
+    default: return "UNKNOWN";
   }
+}
 
-  // Update OLED
-  static unsigned long lastOLEDUpdate = 0;
-  if (now - lastOLEDUpdate > 200) {
-    updateOLED(stateName, remainingTime);
-    lastOLEDUpdate = now;
+void sendToServer(String payload) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(SERVER_URL);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpCode = http.POST(payload);
+  if (httpCode > 0) {
+    Serial.printf("[SERVER] Response: %d\n", httpCode);
+  } else {
+    Serial.printf("[SERVER] Failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
-
-  delay(50);
+  http.end();
 }
